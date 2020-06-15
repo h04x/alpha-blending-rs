@@ -1,10 +1,16 @@
-use image::{Rgba, RgbaImage};
-use ocl::enums::{ImageChannelDataType, ImageChannelOrder, MemObjectType};
-use ocl::{Context, Device, Image, Kernel, Program, Queue};
 //use std::process::Command;
-use core::ops::Deref;
-use core::ops::DerefMut;
+use image::{Rgba, RgbaImage};
 use std::time::Instant;
+use rand::Rng;
+
+use std::mem::transmute;
+use core::convert::TryInto;
+use core::convert::TryFrom;
+
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+#[cfg(target_arch = "x86")]
+use std::arch::x86::*;
 
 fn gen_images(w: u32, h: u32) -> (RgbaImage, RgbaImage) {
     let mut im1 = RgbaImage::new(w, h);
@@ -13,14 +19,13 @@ fn gen_images(w: u32, h: u32) -> (RgbaImage, RgbaImage) {
     }
     let mut im2 = RgbaImage::new(w, h);
     for p in im2.pixels_mut() {
-        *p = Rgba([10, 217, 100, 123])
+        *p = Rgba([10, 217, 100, 200])
     }
     (im1, im2)
 }
 
 fn blend_on_floats_universal(im1: &mut RgbaImage, im2: &RgbaImage) {
-    // from image library
-    // build in img crate algorythm
+    // from image crate
     let max_t = u8::max_value();
     let max_t = max_t as f32;
     for (im1p, im2p) in im1.pixels_mut().zip(im2.pixels()) {
@@ -74,7 +79,8 @@ fn blend_on_floats_universal(im1: &mut RgbaImage, im2: &RgbaImage) {
 }
 
 fn blend_optimized_universal(im1: &mut RgbaImage, im2: &RgbaImage) {
-    for (im1p, im2p) in im1.pixels_mut().zip(im2.pixels()) {
+    //for (im1p, im2p) in im1.pixels_mut().zip(im2.pixels()) {
+        for (im1p, im2p) in im1.pixels_mut().zip(im2.pixels()) {
         let src_r = im2p.0[0] as u32;
         let src_g = im2p.0[1] as u32;
         let src_b = im2p.0[2] as u32;
@@ -94,7 +100,7 @@ fn blend_optimized_universal(im1: &mut RgbaImage, im2: &RgbaImage) {
         let dst_g_p = (dst_g * dst_a) >> 8;
         let dst_b_p = (dst_b * dst_a) >> 8;
 
-        let src_a_not = 256 - src_a;
+        let src_a_not = 255 - src_a;
 
         let r = (src_r_p) + ((src_a_not * (dst_r_p)) >> 8);
         let g = (src_g_p) + ((src_a_not * (dst_g_p)) >> 8);
@@ -125,241 +131,6 @@ fn blend_optimized_universal(im1: &mut RgbaImage, im2: &RgbaImage) {
     }
 }
 
-fn blend_opencl_universal(
-    im1: &mut RgbaImage,
-    im2: &RgbaImage,
-) -> ocl::Result<std::time::Duration> {
-    let src = r#"    
-    __constant sampler_t sampler_const =
-    CLK_NORMALIZED_COORDS_FALSE |
-    CLK_ADDRESS_NONE |
-    CLK_FILTER_NEAREST;;
-    
-    __kernel void kern_func(
-        write_only image2d_t dst_image_writable,
-        read_only image2d_t dst_image_readable,
-        read_only image2d_t src_image_readable)
-    {
-        int2 coord = (int2)(get_global_id(0), get_global_id(1));
-        float4 src_pixel = read_imagef(src_image_readable, sampler_const, coord);
-        float4 dst_pixel = read_imagef(dst_image_readable, sampler_const, coord);
-        float alpha_final = dst_pixel.w + src_pixel.w - dst_pixel.w * src_pixel.w;
-        float bg_r_a = dst_pixel.x * dst_pixel.w;
-        float bg_g_a = dst_pixel.y * dst_pixel.w;
-        float bg_b_a = dst_pixel.z * dst_pixel.w;
-        float fg_r_a = src_pixel.x * src_pixel.w;
-        float fg_g_a = src_pixel.y * src_pixel.w;
-        float fg_b_a = src_pixel.z * src_pixel.w;
-        float out_r_a = fg_r_a + bg_r_a * (1.0 - src_pixel.w);
-        float out_g_a = fg_g_a + bg_g_a * (1.0 - src_pixel.w);
-        float out_b_a = fg_b_a + bg_b_a * (1.0 - src_pixel.w);
-        float4 blended = (float4)(
-            out_r_a / alpha_final,
-            out_g_a / alpha_final,
-            out_b_a / alpha_final,
-            alpha_final
-        );
-        write_imagef(dst_image_writable, coord, blended);  
-    }"#;
-
-    let context = Context::builder()
-        .devices(Device::specifier().first())
-        .build()
-        .unwrap();
-    let device = context.devices()[0];
-    let queue = Queue::new(&context, device, None).unwrap();
-
-    let program = Program::builder()
-        .src(src)
-        .devices(device)
-        .build(&context)
-        .unwrap();
-    /*let sup_img_formats = Image::<u8>::supported_formats(&context, ocl::flags::MEM_READ_WRITE,
-        MemObjectType::Image2d).unwrap();
-    println!("Image formats supported: {:?}.", sup_img_formats);*/
-    let dims = im1.dimensions();
-
-    let dst_image_writable = Image::<u8>::builder()
-        .channel_order(ImageChannelOrder::Rgba)
-        .channel_data_type(ImageChannelDataType::UnormInt8)
-        .image_type(MemObjectType::Image2d)
-        .dims(&dims)
-        .flags(
-            ocl::flags::MEM_WRITE_ONLY
-                | ocl::flags::MEM_HOST_READ_ONLY
-                | ocl::flags::MEM_COPY_HOST_PTR,
-        )
-        .copy_host_slice(im1)
-        .queue(queue.clone())
-        .build()
-        .unwrap();
-
-    let dst_image_readable = Image::<u8>::builder()
-        .channel_order(ImageChannelOrder::Rgba)
-        .channel_data_type(ImageChannelDataType::UnormInt8)
-        .image_type(MemObjectType::Image2d)
-        .dims(&dims)
-        .flags(
-            ocl::flags::MEM_READ_ONLY
-                | ocl::flags::MEM_HOST_WRITE_ONLY
-                | ocl::flags::MEM_COPY_HOST_PTR,
-        )
-        .copy_host_slice(im1)
-        .queue(queue.clone())
-        .build()
-        .unwrap();
-
-    let src_image_readable = Image::<u8>::builder()
-        .channel_order(ImageChannelOrder::Rgba)
-        .channel_data_type(ImageChannelDataType::UnormInt8)
-        .image_type(MemObjectType::Image2d)
-        .dims(&dims)
-        .flags(
-            ocl::flags::MEM_READ_ONLY
-                | ocl::flags::MEM_HOST_WRITE_ONLY
-                | ocl::flags::MEM_COPY_HOST_PTR,
-        )
-        .copy_host_slice(im2)
-        .queue(queue.clone())
-        .build()
-        .unwrap();
-
-    let kernel = Kernel::builder()
-        .program(&program)
-        .name("kern_func")
-        .queue(queue)
-        .global_work_size(&dims)
-        //.arg_sampler(&sampler)
-        .arg(&dst_image_writable)
-        .arg(&dst_image_readable)
-        .arg(&src_image_readable)
-        .build()
-        .unwrap();
-
-    unsafe {
-        kernel.enq().unwrap();
-    }
-    dst_image_writable.read(im1).enq().unwrap();
-
-    // hope double invoke is a right way to calc time
-    let t = Instant::now();
-    unsafe {
-        kernel.enq().unwrap();
-    }
-    dst_image_writable.read(im1).enq().unwrap();
-    let t = t.elapsed();
-    Ok(t)
-}
-
-fn blend_opencl_bg_opaque(
-    im1: &mut RgbaImage,
-    im2: &RgbaImage,
-) -> ocl::Result<std::time::Duration> {
-    let src = r#"    
-    __constant sampler_t sampler_const =
-    CLK_NORMALIZED_COORDS_FALSE |
-    CLK_ADDRESS_NONE |
-    CLK_FILTER_NEAREST;;
-    
-    __kernel void kern_func(
-        write_only image2d_t dst_image_writable,
-        read_only image2d_t dst_image_readable,
-        read_only image2d_t src_image_readable)
-    {
-        int2 coord = (int2)(get_global_id(0), get_global_id(1));
-        float4 src_pixel = read_imagef(src_image_readable, sampler_const, coord);
-        float4 dst_pixel = read_imagef(dst_image_readable, sampler_const, coord);
-        float4 blended = mix(dst_pixel, src_pixel, src_pixel.w);
-        blended.w = 255;
-        write_imagef(dst_image_writable, coord, blended);  
-    }"#;
-
-    let context = Context::builder()
-        .devices(Device::specifier().first())
-        .build()
-        .unwrap();
-    let device = context.devices()[0];
-    let queue = Queue::new(&context, device, None).unwrap();
-
-    let program = Program::builder()
-        .src(src)
-        .devices(device)
-        .build(&context)
-        .unwrap();
-    let dims = im1.dimensions();
-
-    let dst_image_writable = Image::<u8>::builder()
-        .channel_order(ImageChannelOrder::Rgba)
-        .channel_data_type(ImageChannelDataType::UnormInt8)
-        .image_type(MemObjectType::Image2d)
-        .dims(&dims)
-        .flags(
-            ocl::flags::MEM_WRITE_ONLY
-                | ocl::flags::MEM_HOST_READ_ONLY
-                | ocl::flags::MEM_COPY_HOST_PTR,
-        )
-        .copy_host_slice(im1)
-        .queue(queue.clone())
-        .build()
-        .unwrap();
-
-    let dst_image_readable = Image::<u8>::builder()
-        .channel_order(ImageChannelOrder::Rgba)
-        .channel_data_type(ImageChannelDataType::UnormInt8)
-        .image_type(MemObjectType::Image2d)
-        .dims(&dims)
-        .flags(
-            ocl::flags::MEM_READ_ONLY
-                | ocl::flags::MEM_HOST_WRITE_ONLY
-                | ocl::flags::MEM_COPY_HOST_PTR,
-        )
-        .copy_host_slice(im1)
-        .queue(queue.clone())
-        .build()
-        .unwrap();
-
-    let src_image_readable = Image::<u8>::builder()
-        .channel_order(ImageChannelOrder::Rgba)
-        .channel_data_type(ImageChannelDataType::UnormInt8)
-        .image_type(MemObjectType::Image2d)
-        .dims(&dims)
-        .flags(
-            ocl::flags::MEM_READ_ONLY
-                | ocl::flags::MEM_HOST_WRITE_ONLY
-                | ocl::flags::MEM_COPY_HOST_PTR,
-        )
-        .copy_host_slice(im2)
-        .queue(queue.clone())
-        .build()
-        .unwrap();
-
-    let kernel = Kernel::builder()
-        .program(&program)
-        .name("kern_func")
-        .queue(queue)
-        .global_work_size(&dims)
-        //.arg_sampler(&sampler)
-        .arg(&dst_image_writable)
-        .arg(&dst_image_readable)
-        .arg(&src_image_readable)
-        .build()
-        .unwrap();
-
-    unsafe {
-        kernel.enq().unwrap();
-    }
-    dst_image_writable.read(im1).enq().unwrap();
-
-    // hope double invoke is a right way to calc time
-    let t = Instant::now();
-    unsafe {
-        kernel.enq().unwrap();
-    }
-    dst_image_writable.read(im1).enq().unwrap();
-    let t = t.elapsed();
-    Ok(t)
-}
-
 fn blend_optimized_bg_opaque(im1: &mut RgbaImage, im2: &RgbaImage) {
     for (im1p, im2p) in im1.pixels_mut().zip(im2.pixels()) {
         let src_r = im2p.0[0] as u32;
@@ -381,81 +152,241 @@ fn blend_optimized_bg_opaque(im1: &mut RgbaImage, im2: &RgbaImage) {
     }
 }
 
-fn blend_unsafe_bg_opaque(im1: &mut RgbaImage, im2: &RgbaImage) {
-    let w = im1.width();
-    let h = im1.height();
-    let im1_raw = im1.deref_mut();
-    let im2_raw = im2.deref();
-    let len = (w * h) / 4;
-    for i in 0..len as usize {
-        let src_a = unsafe { *im2_raw.get_unchecked(i * 4 + 3) as u32 };
+
+unsafe fn blend_unsafe_bg_opaque(im1: &mut [u8], im2: &[u8]) {
+
+    for chunk in im1.chunks_exact_mut(4).zip(im2.chunks_exact(4)) {
+        let src_a = *chunk.1.get_unchecked(3) as u32 ;
         let src_a_not = 255 - src_a;
-        {
-            let dst_r = unsafe { im1_raw.get_unchecked_mut(i * 4) };
-            let src_r = unsafe { *im2_raw.get_unchecked(i * 4) as u32 };
+
+            let dst_r = chunk.0.get_unchecked_mut(0);
+            let src_r = *chunk.1.get_unchecked(0) as u32;
             let r = ((src_r * src_a) + (src_a_not * *dst_r as u32)) >> 8;
             *dst_r = r as u8;
-        }
-        {
-            let dst_g = unsafe { im1_raw.get_unchecked_mut(i * 4 + 1) };
-            let src_g = unsafe { *im2_raw.get_unchecked(i * 4 + 1) as u32 };
+
+            let dst_g = chunk.0.get_unchecked_mut(1) ;
+            let src_g = *chunk.1.get_unchecked(1) as u32 ;
             let g = ((src_g * src_a) + (src_a_not * *dst_g as u32)) >> 8;
             *dst_g = g as u8;
-        }
-        {
-            let dst_b = unsafe { im1_raw.get_unchecked_mut(i * 4 + 2) };
-            let src_b = unsafe { *im2_raw.get_unchecked(i * 4 + 2) as u32 };
+
+            let dst_b = chunk.0.get_unchecked_mut(2) ;
+            let src_b = *chunk.1.get_unchecked(2) as u32 ;
             let b = ((src_b * src_a) + (src_a_not * *dst_b as u32)) >> 8;
             *dst_b = b as u8;
-        }
+
     }
 }
 
-fn blend_raw(im1_raw: &mut Vec<u8>, im2_raw: &Vec<u8>) {
-    for i in 0..im1_raw.len() / 4 {
-        let src_a = unsafe { *im2_raw.get_unchecked(i * 4 + 3) as u32 };
-        let src_a_not = 255 - src_a;
-        {
-            let dst_r = unsafe { im1_raw.get_unchecked_mut(i * 4) };
-            let src_r = unsafe { *im2_raw.get_unchecked(i * 4) as u32 };
-            let r = ((src_r * src_a) + (src_a_not * *dst_r as u32)) >> 8;
-            *dst_r = r as u8;
-        }
-        {
-            let dst_g = unsafe { im1_raw.get_unchecked_mut(i * 4 + 1) };
-            let src_g = unsafe { *im2_raw.get_unchecked(i * 4 + 1) as u32 };
-            let g = ((src_g * src_a) + (src_a_not * *dst_g as u32)) >> 8;
-            *dst_g = g as u8;
-        }
-        {
-            let dst_b = unsafe { im1_raw.get_unchecked_mut(i * 4 + 2) };
-            let src_b = unsafe { *im2_raw.get_unchecked(i * 4 + 2) as u32 };
-            let b = ((src_b * src_a) + (src_a_not * *dst_b as u32)) >> 8;
-            *dst_b = b as u8;
-        }
+#[target_feature(enable = "sse2,ssse3")]
+unsafe fn blend_sse2_ssse3(im1: &mut [u8], im2: &[u8]) {
+    let (dst_prefix, dst_arr, dst_suffix) = im1.align_to_mut::<i64>();
+    let (src_prefix, src_arr, src_suffix) = im2.align_to::<i64>();
+    //println!("{:?} {:?}", dst_prefix.len(), dst_suffix.len());
+
+    let rgb_shuffler:[u8;16] = [
+        0b00000000,0b10000000,
+        0b00000001,0b10000000,
+        0b00000010,0b10000000,
+        0b00000100,0b10000000,
+        0b00000101,0b10000000,
+        0b00000110,0b10000000,
+        0b10000000,0b10000000,
+        0b10000000,0b10000000];
+    //rgb_shuffler.reverse();
+    let rgb_shuffler = _mm_load_si128(rgb_shuffler.as_ptr() as *const std::arch::x86_64::__m128i);
+
+
+    let alpha_shuffler: [u8; 16] =  [
+        0b00000011,0b10000000,
+        0b00000011,0b10000000,
+        0b00000011,0b10000000,
+        0b00000111,0b10000000,
+        0b00000111,0b10000000,
+        0b00000111,0b10000000,
+        0b10000000,0b10000000,
+        0b10000000,0b10000000];
+    //alpha_shuffler.reverse();
+    let alpha_shuffler = _mm_load_si128(alpha_shuffler.as_ptr() as *const std::arch::x86_64::__m128i);
+
+    let unpacker: [u8; 16] = [
+        0b00000001,0b00000011,
+        0b00000101,0b10000000,
+        0b00000111,0b00001001,
+        0b00001011,0b10000000,
+        0b10000000,0b10000000,
+        0b10000000,0b10000000,
+        0b10000000,0b10000000,
+        0b10000000,0b10000000];
+    //unpacker.reverse();
+    let unpacker = _mm_load_si128(unpacker.as_ptr() as *const std::arch::x86_64::__m128i);
+
+    //let dst_arr = dst_arr.chunks_exact_mut(2);
+    //let src_arr = src_arr.chunks_exact(2);
+    for chunk in dst_arr.iter_mut().zip(src_arr)  {
+        let src_pix_pack_2 = _mm_set_epi64x(
+            0,
+            *chunk.1
+        );
+
+        let dst_pix_pack_2 = _mm_set_epi64x(
+            0,
+            *chunk.0
+        );
+
+        let dec255 = _mm_set1_epi16(255 as i16);
+
+        let src_pix_pack2_shuffle = _mm_shuffle_epi8(src_pix_pack_2, rgb_shuffler);
+        let dst_pix_pack2_shuffle = _mm_shuffle_epi8(dst_pix_pack_2, rgb_shuffler);
+        let src_alpha_shuffle = _mm_shuffle_epi8(src_pix_pack_2, alpha_shuffler);
+        let src_alpha_not = _mm_subs_epu8(dec255, src_alpha_shuffle);
+        let src_premul = _mm_mullo_epi16(src_pix_pack2_shuffle, src_alpha_shuffle);
+        let dst_mul_alpha_not = _mm_mullo_epi16(dst_pix_pack2_shuffle, src_alpha_not);
+        let added = _mm_add_epi16(src_premul, dst_mul_alpha_not);
+        let unpacked = _mm_shuffle_epi8(added, unpacker);
+
+        /*let xxx: (u16,u16,u16,u16,u16,u16,u16,u16) = transmute(added);
+        println!("{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
+                 xxx.0, xxx.1, xxx.2, xxx.3, xxx.4, xxx.5, xxx.6, xxx.7);*/
+
+        /*let xxx: (u8,u8,u8,u8,u8,u8,u8,u8,u8,u8,u8,u8,u8,u8,u8,u8) = transmute(added);
+        println!("{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
+                xxx.0, xxx.1, xxx.2, xxx.3, xxx.4, xxx.5, xxx.6, xxx.7,
+                xxx.8, xxx.9, xxx.10, xxx.11, xxx.12, xxx.13, xxx.14, xxx.15);*/
+
+        let r: (i64,i64) = transmute(unpacked);
+        //println!("{:b}", r.0);
+        *chunk.0 = (r.0 | 255 << 56) | 255 << 24;
+    }
+}
+
+#[target_feature(enable = "avx,avx2")]
+unsafe fn blend_avx_avx2(im1: &mut [u8], im2: &[u8]) {
+    let (dst_prefix, dst_arr, dst_suffix) = im1.align_to_mut::<i64>();
+    let (src_prefix, src_arr, src_suffix) = im2.align_to::<i64>();
+    //println!("{:?} {:?}", dst_prefix.len(), dst_suffix.len());
+
+    let mut rgb_shuffler:[u8;32] = [
+        0b10000000,0b10000000,
+        0b10000000,0b10000000,
+        0b10000000,0b10000000,
+        0b10000000,0b10000000,
+        0b10000000,0b00001110,
+        0b10000000,0b00001101,
+        0b10000000,0b00001100,
+        0b10000000,0b00001010,
+        0b10000000,0b00001001,
+        0b10000000,0b00001000,
+        0b10000000,0b00000110,
+        0b10000000,0b00000101,
+        0b10000000,0b00000100,
+        0b10000000,0b00000010,
+        0b10000000,0b00000001,
+        0b10000000,0b00000000
+    ];
+    rgb_shuffler.reverse();
+    let rgb_shuffler = _mm256_load_si256(rgb_shuffler.as_ptr() as *const std::arch::x86_64::__m256i);
+
+
+    let mut alpha_shuffler: [u16; 16] =  [
+        0b10000000_10000000,
+        0b10000000_10000000,
+        0b10000000_10000000,
+        0b10000000_10000000,
+        0b10000000_00001111,
+        0b10000000_00001111,
+        0b10000000_00001111,
+        0b10000000_00001011,
+        0b10000000_10001011,
+        0b10000000_10001011,
+        0b10000000_00000111,
+        0b10000000_00000111,
+        0b10000000_00000111,
+        0b10000000_00000011,
+        0b10000000_00000011,
+        0b10000000_00000011,
+    ];
+    alpha_shuffler.reverse();
+    let alpha_shuffler = _mm256_load_si256(alpha_shuffler.as_ptr() as *const std::arch::x86_64::__m256i);
+
+    let mut unpacker: [u16; 16] = [
+        0b10000000_10000000,
+        0b10000000_10000000,
+        0b10000000_10000000,
+        0b10000000_10000000,
+        0b10000000_10000000,
+        0b10000000_10000000,
+        0b10000000_10000000,
+        0b10000000_10000000,
+        0b10000000_00010111,
+        0b00010101_10010011,
+        0b10000000_10010001,
+        0b00001111_00001101,
+        0b10000000_00001011,
+        0b00001001_00000111,
+        0b10000000_00000101,
+        0b00000011_00000001,
+    ];
+    unpacker.reverse();
+    let unpacker = _mm256_load_si256(unpacker.as_ptr() as *const std::arch::x86_64::__m256i);
+
+    //let dst_arr = dst_arr.chunks_exact_mut(2);
+    //let src_arr = src_arr.chunks_exact(2);
+    let dst_arr = dst_arr.chunks_exact_mut(2);
+    let src_arr = src_arr.chunks_exact(2);
+    for chunk in dst_arr.zip(src_arr)  {
+        let src_pix_pack_4 = _mm256_set_epi64x(
+            0,
+            0,
+            *chunk.1.get_unchecked(0),
+            *chunk.1.get_unchecked(1)
+        );
+
+        let dst_pix_pack_4 = _mm256_set_epi64x(
+            0,
+            0,
+            *chunk.0.get_unchecked(0),
+            *chunk.0.get_unchecked(1)
+        );
+
+        let dec255 = _mm256_set1_epi16(255 as i16);
+
+        let src_pix_pack4_shuffle = _mm256_shuffle_epi8(src_pix_pack_4, rgb_shuffler);
+        let dst_pix_pack4_shuffle = _mm256_shuffle_epi8(dst_pix_pack_4, rgb_shuffler);
+        let src_alpha_shuffle = _mm256_shuffle_epi8(src_pix_pack_4, alpha_shuffler);
+        let src_alpha_not = _mm256_subs_epu8(dec255, src_alpha_shuffle);
+        let src_premul = _mm256_mullo_epi16(src_pix_pack4_shuffle, src_alpha_shuffle);
+        let dst_mul_alpha_not = _mm256_mullo_epi16(dst_pix_pack4_shuffle, src_alpha_not);
+        let added = _mm256_add_epi16(src_premul, dst_mul_alpha_not);
+        let unpacked = _mm256_shuffle_epi8(added, unpacker);
+        //_mm256_shuffle_epi8
+
+        /*let xxx: (u16,u16,u16,u16,u16,u16,u16,u16) = transmute(added);
+        println!("{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
+                 xxx.0, xxx.1, xxx.2, xxx.3, xxx.4, xxx.5, xxx.6, xxx.7);*/
+
+        /*let xxx: (u8,u8,u8,u8,u8,u8,u8,u8,u8,u8,u8,u8,u8,u8,u8,u8) = transmute(added);
+        println!("{:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?} {:?}",
+                xxx.0, xxx.1, xxx.2, xxx.3, xxx.4, xxx.5, xxx.6, xxx.7,
+                xxx.8, xxx.9, xxx.10, xxx.11, xxx.12, xxx.13, xxx.14, xxx.15);*/
+
+        let r: (i64,i64,i128) = transmute(unpacked);
+        //println!("{:b}", r.0);
+        *chunk.0.get_unchecked_mut(0) = (r.0 | 255 << 56) | 255 << 24;
+        *chunk.0.get_unchecked_mut(1) = (r.1 | 255 << 56) | 255 << 24;
     }
 }
 
 fn main() {
-    let context = Context::builder()
-        .devices(Device::specifier().first())
-        .build()
-        .unwrap();
-    let device = context.devices()[0];
-    println!("{}", device.name().unwrap());
-
     let w = 1920;
     let h = 1200;
 
     let (im1, im2) = gen_images(w, h);
-    im1.save("im1.png").unwrap();
-    im2.save("im2.png").unwrap();
 
     let mut im1c = im1.clone();
     let t = Instant::now();
     blend_on_floats_universal(&mut im1c, &im2);
     println!(
-        "blend_on_floats_universal {:?} / {:?}",
+        "blend_on_floats_universal\t{:?} / {:?}",
         t.elapsed(),
         im1c.get_pixel(0, 0)
     );
@@ -464,65 +395,56 @@ fn main() {
     let t = Instant::now();
     blend_optimized_universal(&mut im1c, &im2);
     println!(
-        "blend_optimized_universal {:?} / {:?}",
+        "blend_optimized_universal\t{:?} / {:?}",
         t.elapsed(),
         im1c.get_pixel(0, 0)
     );
-
-    let mut im1c = im1.clone();
-    let t = blend_opencl_universal(&mut im1c, &im2).unwrap();
-    println!(
-        "blend_opencl_universal\t {:?} / {:?}",
-        t,
-        im1c.get_pixel(0, 0)
-    );
-
-    let mut im1c = im1.clone();
-    let t = blend_opencl_bg_opaque(&mut im1c, &im2).unwrap();
-    println!(
-        "blend_opencl_bg_opaque\t {:?} / {:?}",
-        t,
-        im1c.get_pixel(0, 0)
-    );
-    im1c.save("blend_opencl_bg_opaque.png").unwrap();
 
     let mut im1c = im1.clone();
     let t = Instant::now();
     blend_optimized_bg_opaque(&mut im1c, &im2);
     println!(
-        "blend_optimized_bg_opaque {:?} / {:?}",
+        "blend_optimized_bg_opaque\t{:?} / {:?}",
         t.elapsed(),
         im1c.get_pixel(0, 0)
     );
 
     let mut im1c = im1.clone();
     let t = Instant::now();
-    blend_unsafe_bg_opaque(&mut im1c, &im2);
+    unsafe { blend_unsafe_bg_opaque(&mut im1c, &im2); }
     println!(
-        "blend_unsafe_bg_opaque {:?} / {:?}",
+        "blend_unsafe_bg_opaque\t\t{:?} / {:?}",
         t.elapsed(),
         im1c.get_pixel(0, 0)
     );
 
-    let mut im1: Vec<u8> = Vec::with_capacity(((w * h) as usize * 4) as usize);
-    let mut im2: Vec<u8> = Vec::with_capacity(((w * h) as usize * 4) as usize);
-    for _ in 0..w * h {
-        im1.push(101);
-        im1.push(102);
-        im1.push(103);
-        im1.push(255);
-
-        im2.push(10);
-        im2.push(217);
-        im2.push(100);
-        im2.push(123);
+    if is_x86_feature_detected!("sse2") & is_x86_feature_detected!("ssse3") {
+        let mut im1c = im1.clone();
+        let t = Instant::now();
+        unsafe { blend_sse2_ssse3(&mut im1c, &im2); };
+        println!(
+            "blend_sse2_ssse3\t\t{:?} / {:?}",
+            t.elapsed(),
+            im1c.get_pixel(1, 2)
+        );
+    } else {
+        println!("sse2/ssse3 not supported");
     }
-    let t = Instant::now();
-    blend_raw(&mut im1, &im2);
-    let elapsed = t.elapsed();
-    println!(
-        "simpel vectors {:?} / {:?}",
-        elapsed,
-        (im1[4], im1[5], im1[6], im1[7])
-    );
+
+    if is_x86_feature_detected!("avx") & is_x86_feature_detected!("avx2") {
+        let mut im1c = im1.clone();
+        let t = Instant::now();
+        unsafe { blend_avx_avx2(&mut im1c, &im2); };
+        println!(
+            "blend_avx_avx2\t\t\t{:?} / {:?}",
+            t.elapsed(),
+            im1c.get_pixel(0, 0)
+        );
+    } else {
+        println!("avx/avx2 not supported");
+    }
+
+    //let _ = Command::new("cmd.exe").arg("/c").arg("pause").status();
+
+
 }
