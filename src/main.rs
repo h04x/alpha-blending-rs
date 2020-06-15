@@ -508,6 +508,7 @@ fn main() {
         im1c.get_pixel(0, 0)
     );
 
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if is_x86_feature_detected!("sse2") & is_x86_feature_detected!("ssse3") {
         let mut im1c = im1.clone();
         let t = Instant::now();
@@ -521,6 +522,7 @@ fn main() {
         println!("sse2/ssse3 not supported");
     }
 
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if is_x86_feature_detected!("sse2") & is_x86_feature_detected!("ssse3") {
         let mut im1c = im1.clone();
         let t = Instant::now();
@@ -534,6 +536,7 @@ fn main() {
         println!("sse2/ssse3 not supported");
     }
 
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if is_x86_feature_detected!("avx") & is_x86_feature_detected!("avx2") {
         let mut im1c = im1.clone();
         let t = Instant::now();
