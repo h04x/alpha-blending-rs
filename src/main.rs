@@ -19,7 +19,7 @@ fn gen_images(w: u32, h: u32) -> (RgbaImage, RgbaImage) {
     }
     let mut im2 = RgbaImage::new(w, h);
     for p in im2.pixels_mut() {
-        *p = Rgba([10, 217, 100, 200])
+        *p = Rgba([23, 50, 240, 108])
     }
     (im1, im2)
 }
@@ -177,6 +177,7 @@ unsafe fn blend_unsafe_bg_opaque(im1: &mut [u8], im2: &[u8]) {
     }
 }
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "sse2,ssse3")]
 unsafe fn blend_sse2_ssse3(im1: &mut [u8], im2: &[u8]) {
     let (dst_prefix, dst_arr, dst_suffix) = im1.align_to_mut::<i64>();
@@ -220,6 +221,8 @@ unsafe fn blend_sse2_ssse3(im1: &mut [u8], im2: &[u8]) {
     //unpacker.reverse();
     let unpacker = _mm_load_si128(unpacker.as_ptr() as *const std::arch::x86_64::__m128i);
 
+    let dec255 = _mm_set1_epi16(255 as i16);
+
     //let dst_arr = dst_arr.chunks_exact_mut(2);
     //let src_arr = src_arr.chunks_exact(2);
     for chunk in dst_arr.iter_mut().zip(src_arr)  {
@@ -233,7 +236,7 @@ unsafe fn blend_sse2_ssse3(im1: &mut [u8], im2: &[u8]) {
             *chunk.0
         );
 
-        let dec255 = _mm_set1_epi16(255 as i16);
+
 
         let src_pix_pack2_shuffle = _mm_shuffle_epi8(src_pix_pack_2, rgb_shuffler);
         let dst_pix_pack2_shuffle = _mm_shuffle_epi8(dst_pix_pack_2, rgb_shuffler);
@@ -259,6 +262,91 @@ unsafe fn blend_sse2_ssse3(im1: &mut [u8], im2: &[u8]) {
     }
 }
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse2,ssse3")]
+unsafe fn blend_sse2_ssse3_2(im1: &mut [u8], im2: &[u8]) {
+    let (dst_prefix, dst_arr, dst_suffix) = im1.align_to_mut::<[i64; 2]>();
+    let (src_prefix, src_arr, src_suffix) = im2.align_to::<[i64; 2]>();
+    //println!("{:?} {:?}", dst_prefix.len(), dst_suffix.len());
+
+    let alpha_extractor = _mm_set_epi8(
+        0b10000000u8 as i8,0b10000000u8 as i8,
+        0b10000000u8 as i8,0b00001110u8 as i8,
+        0b10000000u8 as i8,0b00001110u8 as i8,
+        0b10000000u8 as i8,0b00001110u8 as i8,
+        0b10000000u8 as i8,0b10000000u8 as i8,
+        0b10000000u8 as i8,0b00000110u8 as i8,
+        0b10000000u8 as i8,0b00000110u8 as i8,
+        0b10000000u8 as i8,0b00000110u8 as i8
+    );
+
+    let packer_lo = _mm_set_epi8(
+        0b10000000u8 as i8,0b10000000u8 as i8,
+        0b10000000u8 as i8,0b10000000u8 as i8,
+        0b10000000u8 as i8,0b10000000u8 as i8,
+        0b10000000u8 as i8,0b10000000u8 as i8,
+        0b10000000u8 as i8,0b00001101u8 as i8,
+        0b00001011u8 as i8,0b00001001u8 as i8,
+        0b10000000u8 as i8,0b00000101u8 as i8,
+        0b00000011u8 as i8,0b00000001u8 as i8
+    );
+
+    let packer_hi = _mm_set_epi8(
+        0b10000000u8 as i8,0b00001101u8 as i8,
+        0b00001011u8 as i8,0b00001001u8 as i8,
+        0b10000000u8 as i8,0b00000101u8 as i8,
+        0b00000011u8 as i8,0b00000001u8 as i8,
+        0b10000000u8 as i8,0b10000000u8 as i8,
+        0b10000000u8 as i8,0b10000000u8 as i8,
+        0b10000000u8 as i8,0b10000000u8 as i8,
+        0b10000000u8 as i8,0b10000000u8 as i8,
+    );
+
+    let zeroes = _mm_set1_epi32(0);
+    let dec255 = _mm_set1_epi16(255u8 as i16);
+    let alpha_inject = _mm_set1_epi32(0b11111111000000000000000000000000u32 as i32);
+
+    //let dst_arr = dst_arr.chunks_exact_mut(2);
+    //let src_arr = src_arr.chunks_exact(2);
+    for chunk in dst_arr.iter().zip(src_arr)  {
+        let src_4pix = _mm_loadu_si128(
+            chunk.1.as_ptr() as *const std::arch::x86_64::__m128i
+        );
+
+        let dst_4pix = _mm_loadu_si128(
+            chunk.0.as_ptr() as *const std::arch::x86_64::__m128i
+        );
+
+        let  src_2pix_lo = _mm_unpacklo_epi8(src_4pix, zeroes);
+        let  src_2pix_hi = _mm_unpackhi_epi8(src_4pix, zeroes);
+        let  dst_2pix_lo = _mm_unpacklo_epi8(dst_4pix, zeroes);
+        let  dst_2pix_hi = _mm_unpackhi_epi8(dst_4pix, zeroes);
+
+
+        let src_alpha_lo = _mm_shuffle_epi8(src_2pix_lo, alpha_extractor);
+        let src_alpha_hi = _mm_shuffle_epi8(src_2pix_hi, alpha_extractor);
+        let src_alpha_not_lo = _mm_subs_epu8(dec255, src_alpha_lo);
+        let src_alpha_not_hi = _mm_subs_epu8(dec255, src_alpha_hi);
+
+        let src_2pix_lo_premul = _mm_mullo_epi16(src_2pix_lo, src_alpha_lo);
+        let src_2pix_hi_premul = _mm_mullo_epi16(src_2pix_hi, src_alpha_hi);
+
+        let dst_2pix_lo_mul_not_alpha = _mm_mullo_epi16(dst_2pix_lo, src_alpha_not_lo);
+        let dst_2pix_hi_mul_not_alpha = _mm_mullo_epi16(dst_2pix_hi, src_alpha_not_hi);
+
+        let sum_lo = _mm_add_epi16(src_2pix_lo_premul, dst_2pix_lo_mul_not_alpha);
+        let sum_hi = _mm_add_epi16(src_2pix_hi_premul, dst_2pix_hi_mul_not_alpha);
+
+        let pack_lo = _mm_shuffle_epi8(sum_lo, packer_lo);
+        let pack_hi = _mm_shuffle_epi8(sum_hi, packer_hi);
+        let combine = _mm_or_si128(pack_lo, pack_hi);
+        let ret = _mm_or_si128(combine, alpha_inject);
+
+        _mm_storeu_si128(chunk.0.as_ptr() as *mut std::arch::x86_64::__m128i, ret);
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx,avx2")]
 unsafe fn blend_avx_avx2(im1: &mut [u8], im2: &[u8]) {
     let (dst_prefix, dst_arr, dst_suffix) = im1.align_to_mut::<i64>();
@@ -329,6 +417,8 @@ unsafe fn blend_avx_avx2(im1: &mut [u8], im2: &[u8]) {
     unpacker.reverse();
     let unpacker = _mm256_load_si256(unpacker.as_ptr() as *const std::arch::x86_64::__m256i);
 
+    let dec255 = _mm256_set1_epi16(255 as i16);
+
     //let dst_arr = dst_arr.chunks_exact_mut(2);
     //let src_arr = src_arr.chunks_exact(2);
     let dst_arr = dst_arr.chunks_exact_mut(2);
@@ -348,7 +438,7 @@ unsafe fn blend_avx_avx2(im1: &mut [u8], im2: &[u8]) {
             *chunk.0.get_unchecked(1)
         );
 
-        let dec255 = _mm256_set1_epi16(255 as i16);
+
 
         let src_pix_pack4_shuffle = _mm256_shuffle_epi8(src_pix_pack_4, rgb_shuffler);
         let dst_pix_pack4_shuffle = _mm256_shuffle_epi8(dst_pix_pack_4, rgb_shuffler);
@@ -431,6 +521,19 @@ fn main() {
         println!("sse2/ssse3 not supported");
     }
 
+    if is_x86_feature_detected!("sse2") & is_x86_feature_detected!("ssse3") {
+        let mut im1c = im1.clone();
+        let t = Instant::now();
+        unsafe { blend_sse2_ssse3_2(&mut im1c, &im2); };
+        println!(
+            "blend_sse2_ssse3_2\t\t{:?} / {:?}",
+            t.elapsed(),
+            im1c.get_pixel(1, 2)
+        );
+    } else {
+        println!("sse2/ssse3 not supported");
+    }
+
     if is_x86_feature_detected!("avx") & is_x86_feature_detected!("avx2") {
         let mut im1c = im1.clone();
         let t = Instant::now();
@@ -443,8 +546,6 @@ fn main() {
     } else {
         println!("avx/avx2 not supported");
     }
-
-    //let _ = Command::new("cmd.exe").arg("/c").arg("pause").status();
 
 
 }
