@@ -1,11 +1,8 @@
 //use std::process::Command;
 use image::{Rgba, RgbaImage};
 use std::time::Instant;
-use rand::Rng;
 
 use std::mem::transmute;
-use core::convert::TryInto;
-use core::convert::TryFrom;
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -154,7 +151,6 @@ fn blend_optimized_bg_opaque(im1: &mut RgbaImage, im2: &RgbaImage) {
 
 
 unsafe fn blend_unsafe_bg_opaque(im1: &mut [u8], im2: &[u8]) {
-
     for chunk in im1.chunks_exact_mut(4).zip(im2.chunks_exact(4)) {
         let src_a = *chunk.1.get_unchecked(3) as u32 ;
         let src_a_not = 255 - src_a;
@@ -182,7 +178,10 @@ unsafe fn blend_unsafe_bg_opaque(im1: &mut [u8], im2: &[u8]) {
 unsafe fn blend_sse2_ssse3(im1: &mut [u8], im2: &[u8]) {
     let (dst_prefix, dst_arr, dst_suffix) = im1.align_to_mut::<i64>();
     let (src_prefix, src_arr, src_suffix) = im2.align_to::<i64>();
-    //println!("{:?} {:?}", dst_prefix.len(), dst_suffix.len());
+    if (dst_prefix.len() + dst_suffix.len()) > 0 {
+        blend_unsafe_bg_opaque(dst_prefix, src_prefix);
+        blend_unsafe_bg_opaque(dst_suffix, src_suffix);
+    }
 
     let rgb_shuffler:[u8;16] = [
         0b00000000,0b10000000,
@@ -268,6 +267,10 @@ unsafe fn blend_sse2_ssse3_2(im1: &mut [u8], im2: &[u8]) {
     let (dst_prefix, dst_arr, dst_suffix) = im1.align_to_mut::<[i64; 2]>();
     let (src_prefix, src_arr, src_suffix) = im2.align_to::<[i64; 2]>();
     //println!("{:?} {:?}", dst_prefix.len(), dst_suffix.len());
+    if ((dst_prefix.len()) + dst_suffix.len()) > 0 {
+        blend_unsafe_bg_opaque(dst_prefix, src_prefix);
+        blend_unsafe_bg_opaque(dst_suffix, src_suffix);
+    }
 
     let alpha_extractor = _mm_set_epi8(
         0b10000000u8 as i8,0b10000000u8 as i8,
@@ -352,6 +355,10 @@ unsafe fn blend_avx_avx2(im1: &mut [u8], im2: &[u8]) {
     let (dst_prefix, dst_arr, dst_suffix) = im1.align_to_mut::<i64>();
     let (src_prefix, src_arr, src_suffix) = im2.align_to::<i64>();
     //println!("{:?} {:?}", dst_prefix.len(), dst_suffix.len());
+    if ((dst_prefix.len()) + dst_suffix.len()) > 0 {
+        blend_unsafe_bg_opaque(dst_prefix, src_prefix);
+        blend_unsafe_bg_opaque(dst_suffix, src_suffix);
+    }
 
     let mut rgb_shuffler:[u8;32] = [
         0b10000000,0b10000000,
